@@ -13,5 +13,28 @@ services:
       QDRANT__SERVICE__GRPC_PORT: 6334
       QDRANT__SERVICE__HTTP_PORT: 6333
 
+  data-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile.dataPipeline
+    environment:
+      PRODUCTS_DATA_FILE_PATH: 'products.json'
+      CLOTHES_COLLECTION_NAME: 'clothes-images'
+      CLOTHES_COLLECTION_EMBEDDING_SIZE: '512'
+      VECTOR_DB_URI: 'http://qdrant:6333'
+      RECOMMENDER_TOP_K: '4'
+    restart: 'no'
+
+  recommender:
+    build:
+      context: .
+      dockerfile: Dockerfile.recommender
+    environment:
+      PRODUCTS_DATA_FILE_PATH: 'products.json'
+      CLOTHES_COLLECTION_NAME: 'clothes-images'
+      CLOTHES_COLLECTION_EMBEDDING_SIZE: '512'
+      VECTOR_DB_URI: 'http://qdrant:6333'
+      RECOMMENDER_TOP_K: '4'
+
 volumes:
   qdrant_storage:

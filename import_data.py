@@ -1,21 +1,26 @@
 import json
+import logging
+import time
+import uuid
 from typing import List
 
-import numpy as np
+import requests
 import torch
 from PIL import Image
-from datasets import Dataset, Image
 from qdrant_client import QdrantClient
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+from qdrant_client.http import models
+from qdrant_client.http.models import PointStruct
 from transformers import CLIPProcessor, CLIPModel
+
+import settings
+
+logging.basicConfig(level=logging.DEBUG,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                    )
 
 
 class DataPipeline:
-    BATCH_SIZE = 50
-    IMAGES_DATA_FILE_PATH = './images_data.json'
-    INDEXED_PRODUCTS_DATA_FILE_PATH = './indexed_products_data.json'
-    CLOTHES_COLLECTION_NAME = 'clothes-images'
+    BATCH_SIZE = 100
 
     def __init__(self, products_data_file_path: str, vector_db_uri: str):
         self.products_data_file_path = products_data_file_path
@@ -24,72 +29,70 @@ class DataPipeline:
         self.client = QdrantClient(url=vector_db_uri)
         self.device = "cpu"
         self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        self.preprocess = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        self.logger = logging.getLogger('data_pipeline')
 
-    def index_data(self):
-        self.products_info = {}
-        self.images_info = {}
+    def encode_images(self, urls: List[str]):
+        images = [
+            Image.open(requests.get(url, stream=True).raw)
+            for url in urls]
 
-        with open(self.products_data_file_path) as products_json_file, \
-                open(self.IMAGES_DATA_FILE_PATH, 'w+') as images_json_file, \
-                open(self.INDEXED_PRODUCTS_DATA_FILE_PATH, 'w+') as indexed_products_json_file:
+        inputs = self.processor(images=images, return_tensors="pt")
+        with torch.no_grad():
+            image_features = self.model.get_image_features(**inputs)
 
+        image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
+        return image_features
+
+    def create_collection(self):
+        if not self.client.collection_exists(settings.CLOTHES_COLLECTION_NAME):
+            self.client.create_collection(settings.CLOTHES_COLLECTION_NAME,
+                                          {'size': settings.CLOTHES_COLLECTION_EMBEDDING_SIZE,
+                                           'distance': models.Distance.COSINE})
+
+    def run(self):
+        self.create_collection()
+        self.logger.info('Starting to import data to vector db ...')
+
+        batch_gen = self.batch_data_generator()
+        for batch_idx, batch in batch_gen:
+            self.logger.info(f'Inserting batch_idx: {batch_idx}')
+
+            batch_img_urls = list(batch.keys())
+            batch_encoded_img = self.encode_images(batch_img_urls)
+            payloads = list(batch.values())
+
+            points = [
+                PointStruct(id=str(uuid.uuid4()), vector=vector, payload=payload)
+                for vector, payload in zip(batch_encoded_img, payloads)
+            ]
+            self.client.upsert(collection_name=settings.CLOTHES_COLLECTION_NAME, points=points)
+
+            self.logger.info(f'Batch with batch_idx: {batch_idx}, batch_size:{str(len(points))} inserted to vector db.')
+            time.sleep(0.1)
+
+    def batch_data_generator(self):
+        with open(self.products_data_file_path) as products_json_file:
             items = json.load(products_json_file)
-            self.products_info = {item["id"]: item for item in items}
+            batch = {}
+            batch_idx = 0
 
             for item in items:
                 for image_url in item['images']:
-                    self.images_info[image_url] = item['id']
+                    batch[image_url] = {key: value for key, value in item.items() if key != 'images'}
 
-            json.dump(self.products_info, indexed_products_json_file, indent=4)
-            json.dump(self.images_info, images_json_file, indent=4)
+                    if len(batch) == self.BATCH_SIZE:
+                        yield batch_idx, batch
+                        batch_idx += 1
+                        batch = {}
 
-    def import_data(self):
-        with open(self.IMAGES_DATA_FILE_PATH) as images_json_file, \
-                open(self.INDEXED_PRODUCTS_DATA_FILE_PATH) as indexed_products_json_file:
-            self.products_info = json.load(indexed_products_json_file)
-            self.images_info = json.load(images_json_file)
-
-    def encode_images(self, images: List[str]):
-        def transform_fn(el):
-            return self.preprocess(images=[Image().decode_example(_) for _ in el['image']], return_tensors='pt')
-
-        dataset = Dataset.from_dict({'image': images})
-        dataset = dataset.cast_column('image', Image(decode=False)) if isinstance(images[0], str) else dataset
-        dataset.set_format('torch')
-        dataset.set_transform(transform_fn)
-
-        dataloader = DataLoader(dataset, batch_size=self.BATCH_SIZE)
-        image_embeddings = []
-        pbar = tqdm(total=len(images) // self.BATCH_SIZE, position=0)
-        with torch.no_grad():
-            for batch in dataloader:
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                image_embeddings.extend(self.model.get_image_features(**batch).detach().cpu().numpy())
-                pbar.update(1)
-            pbar.close()
-
-        return np.stack(image_embeddings)
-
-    def create_collection(self):
-        collections = self.client.get_collections()
-        collection_exists = any(collection['name'] == self.CLOTHES_COLLECTION_NAME for collection in collections)
-
-        if not collection_exists:
-            self.client.create_collection(self.CLOTHES_COLLECTION_NAME)
-
-    def run(self):
-        self.index_data()
-
-        sample_images = list(self.images_info.keys())[:2]
-        encodings = self.encode_images(sample_images)
-
-        print(len(encodings), type(encodings[0]), encodings.shape)
+            if len(batch) != 0:
+                yield batch
 
 
 def main():
-    pipeline = DataPipeline(products_data_file_path='./products.json',
-                            vector_db_uri='http://localhost:6333')
+    pipeline = DataPipeline(products_data_file_path=settings.PRODUCTS_DATA_FILE_PATH,
+                            vector_db_uri=settings.VECTOR_DB_URI)
     pipeline.run()
 
 
